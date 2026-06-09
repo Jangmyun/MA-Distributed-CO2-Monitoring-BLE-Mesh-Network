@@ -464,6 +464,14 @@ void model_handler_publish_accel(int32_t x_centi, int32_t y_centi, int32_t z_cen
 	snprintf((char *)msg, sizeof(msg), "A:%d,%d,%d",
 		 (int)x_centi, (int)y_centi, (int)z_centi);
 
+	/* 앱에서 설정된 retransmit을 무시하고 강제로 0으로 설정.
+	 * 1000ms 주기 publish에서 retransmit이 SAR 컨텍스트를 고갈시키는 것을 방지.
+	 * BT_MESH_PUB_RETRANSMIT(count=0, steps=0) = 0
+	 */
+	if (chat.model && chat.model->pub) {
+		chat.model->pub->retransmit = 0;
+	}
+
 	int err = bt_mesh_chat_cli_message_send(&chat, msg);
 
 	if (err && err != -EADDRNOTAVAIL) {

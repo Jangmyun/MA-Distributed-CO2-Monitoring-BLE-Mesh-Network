@@ -39,7 +39,7 @@ LOG_MODULE_REGISTER(chat, CONFIG_LOG_DEFAULT_LEVEL);
 #define ACCEL_NODE       DT_NODELABEL(adxl345)
 #define LCD_I2C_NODE     DT_NODELABEL(i2c0)
 #define LCD_ADDR         0x27
-#define POLL_INTERVAL_MS 500
+#define POLL_INTERVAL_MS 1000
 
 /* PCF8574 핀 마스크 */
 #define LCD_RS  BIT(0)
