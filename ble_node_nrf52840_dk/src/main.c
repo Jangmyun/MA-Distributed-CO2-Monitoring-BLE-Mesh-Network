@@ -219,6 +219,12 @@ int main(void)
 		settings_load();
 	}
 
+	/* ── 프로비저닝 Bearer 활성화 ──
+	 * settings_load()로 이미 프로비저닝된 경우 no-op.
+	 * 미프로비저닝 상태이면 ADV + GATT bearer로 광고 시작 → 앱에서 인식 가능.
+	 */
+	bt_mesh_prov_enable(BT_MESH_PROV_ADV | BT_MESH_PROV_GATT);
+
 	lcd_set_cursor(0, 0);
 	lcd_puts("BLE Mesh Ready! ");
 	lcd_set_cursor(0, 1);
