@@ -5,6 +5,7 @@
  */
 
 #include <stdio.h>
+#include <stdlib.h>
 
 #include <zephyr/bluetooth/bluetooth.h>
 #include <bluetooth/mesh/models.h>
@@ -20,6 +21,9 @@
 LOG_MODULE_DECLARE(chat);
 
 static const struct shell *chat_shell;
+
+/* ── 원격 노드 가속도 데이터 저장소 ─────────────────────────────────────── */
+static struct model_handler_remote_accel remote_accel;
 
 /******************************************************************************/
 /*************************** Health server setup ******************************/
@@ -184,11 +188,34 @@ static void handle_chat_message(struct bt_mesh_chat_cli *chat,
 				struct bt_mesh_msg_ctx *ctx,
 				const uint8_t *msg)
 {
-	/* Don't print own messages. */
+	/* Don't process own messages. */
 	if (address_is_local(chat->model, ctx->addr)) {
 		return;
 	}
 
+	/*
+	 * 가속도 데이터 메시지 파싱: "A:<x_centi>,<y_centi>,<z_centi>"
+	 * 예) "A:123,-234,981"  →  x=1.23, y=-2.34, z=9.81 m/s²
+	 */
+	if (msg[0] == 'A' && msg[1] == ':') {
+		const char *p = (const char *)msg + 2;
+		char *end;
+
+		int32_t xi = (int32_t)strtol(p,       &end, 10);
+		if (*end != ',') goto fallback;
+		int32_t yi = (int32_t)strtol(end + 1, &end, 10);
+		if (*end != ',') goto fallback;
+		int32_t zi = (int32_t)strtol(end + 1, &end, 10);
+
+		remote_accel.addr    = ctx->addr;
+		remote_accel.x_centi = xi;
+		remote_accel.y_centi = yi;
+		remote_accel.z_centi = zi;
+		remote_accel.valid   = true;
+		return;
+	}
+
+fallback:
 	shell_print(chat_shell, "<0x%04X>: %s", ctx->addr, msg);
 }
 
@@ -425,7 +452,26 @@ const struct bt_mesh_comp *model_handler_init(void)
 	k_work_init_delayable(&attention_blink_work, attention_blink);
 
 	chat_shell = shell_backend_uart_get_ptr();
-	shell_print(chat_shell, ">>> Bluetooth Mesh Chat sample <<<");
+	shell_print(chat_shell, ">>> BLE Mesh Accel Node <<<");
 
 	return &comp;
+}
+
+void model_handler_publish_accel(int32_t x_centi, int32_t y_centi, int32_t z_centi)
+{
+	uint8_t msg[32];
+
+	snprintf((char *)msg, sizeof(msg), "A:%d,%d,%d",
+		 (int)x_centi, (int)y_centi, (int)z_centi);
+
+	int err = bt_mesh_chat_cli_message_send(&chat, msg);
+
+	if (err && err != -EADDRNOTAVAIL) {
+		LOG_WRN("accel publish failed: %d", err);
+	}
+}
+
+const struct model_handler_remote_accel *model_handler_get_remote_accel(void)
+{
+	return &remote_accel;
 }
