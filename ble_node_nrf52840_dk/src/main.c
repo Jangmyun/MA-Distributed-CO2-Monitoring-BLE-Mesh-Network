@@ -26,6 +26,7 @@
 #include <zephyr/drivers/sensor.h>
 #include <zephyr/drivers/i2c.h>
 #include <zephyr/bluetooth/bluetooth.h>
+#include <zephyr/bluetooth/mesh.h>
 #include <zephyr/settings/settings.h>
 #include <bluetooth/mesh/dk_prov.h>
 #include <dk_buttons_and_leds.h>
@@ -50,6 +51,37 @@ LOG_MODULE_REGISTER(chat, CONFIG_LOG_DEFAULT_LEVEL);
 #define LCD_BL  BIT(3)
 
 static const struct device *lcd_i2c;
+
+/* ── LCD forward declarations (본문은 아래 정의) ────────────────────────────── */
+static void lcd_set_cursor(uint8_t col, uint8_t row);
+static void lcd_puts(const char *s);
+
+/* ── 프로비저닝 리셋 (Button 1 5초 꾹) ─────────────────────────────────────── */
+
+static struct k_work_delayable prov_reset_work;
+
+static void prov_reset_handler(struct k_work *work)
+{
+	LOG_INF("Button 1 held 5s — resetting provisioning");
+	lcd_set_cursor(0, 0);
+	lcd_puts("Resetting prov..");
+	lcd_set_cursor(0, 1);
+	lcd_puts("Please wait...  ");
+	bt_mesh_reset();
+	LOG_INF("Provisioning reset complete. Re-provision to rejoin.");
+}
+
+static void button_handler(uint32_t button_state, uint32_t has_changed)
+{
+	if (!(has_changed & DK_BTN1_MSK)) {
+		return;
+	}
+	if (button_state & DK_BTN1_MSK) {
+		k_work_reschedule(&prov_reset_work, K_SECONDS(5));
+	} else {
+		k_work_cancel_delayable(&prov_reset_work);
+	}
+}
 
 /* ── 이벤트 기반 publish 상태 ─────────────────────────────────────────────── */
 
@@ -214,7 +246,9 @@ int main(void)
 		return err;
 	}
 
-	err = dk_buttons_init(NULL);
+	k_work_init_delayable(&prov_reset_work, prov_reset_handler);
+
+	err = dk_buttons_init(button_handler);
 	if (err) {
 		printk("Buttons init failed: %d\n", err);
 		return err;
