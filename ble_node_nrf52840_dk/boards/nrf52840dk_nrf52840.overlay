@@ -45,6 +45,7 @@
 			psels = <NRF_PSEL(TWIM_SDA, 0, 26)>,
 				<NRF_PSEL(TWIM_SCL, 0, 27)>;
 			low-power-enable;
+			bias-pull-up;  /* sleep 중 버스 HIGH 유지 → 복귀 시 hang 방지 */
 		};
 	};
 };
@@ -62,5 +63,15 @@
 		reg = <0x53>;
 		/* SDO → VCC 연결 시 reg = <0x1D> 로 변경 */
 		/* NCS v2.4.0 바인딩은 int-gpios 미지원 — 폴링 모드로 동작 */
+	};
+
+	/* PCF8574 I2C 백팩 (LCD 1602) — main.c 에서 i2c_write()로 직접 제어 */
+	pcf8574: pcf8574@27 {
+		compatible = "nxp,pcf8574";
+		reg = <0x27>;
+		/* PCF8574AT 칩 사용 시 reg = <0x3F> 로 변경 */
+		gpio-controller;
+		#gpio-cells = <2>;
+		ngpios = <8>;
 	};
 };

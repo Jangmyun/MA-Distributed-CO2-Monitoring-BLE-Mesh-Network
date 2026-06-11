@@ -1,28 +1,45 @@
 /*
- * ADXL345 가속도계 (GY-291) → 1602 LCD (PCF8574 I2C 백팩) 출력
+ * BLE Mesh 분산 가속도 모니터링 노드
+ *
+ * 동작:
+ *   1. ADXL345 (I2C 0x53) 에서 X/Y/Z 가속도를 500 ms 마다 읽는다.
+ *   2. Provisioned 상태이면 BLE Mesh로 데이터를 publish 한다.
+ *      메시지 포맷: "A:<x_centi>,<y_centi>,<z_centi>"
+ *      예) "A:123,-234,981" → x=1.23, y=-2.34, z=9.81 m/s²
+ *   3. 다른 노드의 데이터를 수신하면 model_handler가 파싱해 저장한다.
+ *   4. LCD 1602 (PCF8574 I2C 백팩 0x27) 에 표시한다.
+ *      Line 0: 로컬 노드 X, Y 가속도
+ *      Line 1: 수신한 원격 노드 주소 + X 가속도
+ *              (미수신: "Mesh: waiting..."  / 미프로비전: "Mesh: no prov  ")
  *
  * I2C 버스 (P0.26 SDA / P0.27 SCL) 공유:
  *   ADXL345  @ 0x53
- *   PCF8574  @ 0x27  (A0=A1=A2=1 기본값)
+ *   PCF8574  @ 0x27
  *
- * PCF8574 비트 배치 (표준 I2C 백팩):
- *   P7-P4 = D7-D4 (LCD 데이터 상위 니블)
- *   P3    = BL (백라이트)
- *   P2    = E  (Enable)
- *   P1    = RW (항상 0 = Write)
- *   P0    = RS (0=Command, 1=Data)
+ * BLE Mesh 프로비저닝:
+ *   nRF Mesh 앱 또는 UART shell 명령으로 수행한다.
+ *   프로비전 후 Chat CLI 모델에 App Key 바인딩 + 그룹 주소 구독 설정 필요.
  */
 
 #include <zephyr/kernel.h>
 #include <zephyr/device.h>
 #include <zephyr/drivers/sensor.h>
 #include <zephyr/drivers/i2c.h>
+#include <zephyr/bluetooth/bluetooth.h>
+#include <zephyr/settings/settings.h>
+#include <bluetooth/mesh/dk_prov.h>
+#include <dk_buttons_and_leds.h>
 #include <stdio.h>
+
+#include "model_handler.h"
+
+#include <zephyr/logging/log.h>
+LOG_MODULE_REGISTER(chat, CONFIG_LOG_DEFAULT_LEVEL);
 
 #define ACCEL_NODE       DT_NODELABEL(adxl345)
 #define LCD_I2C_NODE     DT_NODELABEL(i2c0)
 #define LCD_ADDR         0x27
-#define POLL_INTERVAL_MS 500
+#define POLL_INTERVAL_MS 1000
 
 /* PCF8574 핀 마스크 */
 #define LCD_RS  BIT(0)
@@ -32,7 +49,7 @@
 
 static const struct device *lcd_i2c;
 
-/* ── PCF8574 / HD44780 저수준 ──────────────────────────────────────── */
+/* ── PCF8574 / HD44780 저수준 ──────────────────────────────────────────── */
 
 static void pcf_write(uint8_t val)
 {
@@ -63,7 +80,7 @@ static void lcd_send(uint8_t byte, uint8_t flags)
 static inline void lcd_cmd(uint8_t cmd) { lcd_send(cmd, 0); }
 static inline void lcd_putc(char c)     { lcd_send((uint8_t)c, LCD_RS); }
 
-/* ── LCD 초기화 (4비트 모드) ───────────────────────────────────────── */
+/* ── LCD 초기화 (4비트 모드) ─────────────────────────────────────────────── */
 
 static void lcd_init(void)
 {
@@ -95,32 +112,59 @@ static void lcd_puts(const char *s)
 	}
 }
 
-/* ── 센서값 포맷 (6문자: 부호 + 2정수 + '.' + 2소수) ─────────────── */
+/* ── 값 포맷 함수 ──────────────────────────────────────────────────────── */
 
+/*
+ * sensor_value → 6문자 문자열: <부호><2정수>.<2소수>
+ * 예) 1.23 → " 01.23"   -2.34 → "-02.34"
+ * buf 크기: 최소 7바이트 (6문자 + null)
+ */
 static void fmt_sv(char *buf, const struct sensor_value *sv)
 {
 	int32_t i = sv->val1;
 	int32_t f = sv->val2;
 
-	/* 부호 통일 */
 	bool neg = (i < 0) || (i == 0 && f < 0);
 	if (i < 0) { i = -i; }
 	if (f < 0) { f = -f; }
 
-	/* 소수점 2자리 (micro → centi) */
-	f = f / 10000;
+	f = f / 10000; /* micro → centi */
 
 	snprintf(buf, 7, "%c%02d.%02d", neg ? '-' : ' ', (int)i, (int)f);
 }
 
-/* ── 메인 ──────────────────────────────────────────────────────────── */
+/*
+ * centiunits (val × 100) → 6문자 문자열 (fmt_sv와 동일 포맷).
+ * 원격 노드 수신 데이터 표시에 사용.
+ * buf 크기: 최소 7바이트
+ */
+static void fmt_centi(char *buf, int32_t cv)
+{
+	bool neg = cv < 0;
+
+	if (neg) { cv = -cv; }
+	snprintf(buf, 7, "%c%02d.%02d", neg ? '-' : ' ',
+		 (int)(cv / 100), (int)(cv % 100));
+}
+
+/* ── sensor_value → centiunits 변환 ────────────────────────────────────── */
+
+static int32_t sv_to_centi(const struct sensor_value *sv)
+{
+	return sv->val1 * 100 + sv->val2 / 10000;
+}
+
+/* ── 메인 ──────────────────────────────────────────────────────────────── */
 
 int main(void)
 {
+	int err;
+
 	const struct device *accel = DEVICE_DT_GET(ACCEL_NODE);
 
 	lcd_i2c = DEVICE_DT_GET(LCD_I2C_NODE);
 
+	/* ── 하드웨어 초기화 ── */
 	if (!device_is_ready(lcd_i2c)) {
 		printk("I2C bus not ready\n");
 		return -ENODEV;
@@ -133,16 +177,68 @@ int main(void)
 
 	lcd_init();
 	lcd_set_cursor(0, 0);
-	lcd_puts("  ADXL345 Init  ");
+	lcd_puts(" BLE Mesh Init  ");
 	lcd_set_cursor(0, 1);
-	lcd_puts("  Waiting...    ");
-	k_msleep(1000);
+	lcd_puts(" Please wait... ");
 
+	/* ── DK 버튼 + LED 초기화 (프로비저닝 OOB + attention blink) ── */
+	/* NCS v2.5.0: dk_buttons_and_leds_init() 제거 → 분리 호출 */
+	err = dk_leds_init();
+	if (err) {
+		printk("LEDs init failed: %d\n", err);
+		return err;
+	}
+
+	err = dk_buttons_init(NULL);
+	if (err) {
+		printk("Buttons init failed: %d\n", err);
+		return err;
+	}
+
+	/* ── BT 스택 활성화 ── */
+	err = bt_enable(NULL);
+	if (err) {
+		printk("bt_enable failed: %d\n", err);
+		return err;
+	}
+
+	/* ── BLE Mesh 초기화 ──
+	 * bt_mesh_dk_prov_init(): DK 보드 기반 OOB 프로비저닝 콜백 반환
+	 *   - Output OOB: LED blink (숫자 표시)
+	 *   - Input  OOB: 버튼 누름 횟수
+	 * model_handler_init(): Chat CLI Vendor Model composition 반환
+	 */
+	err = bt_mesh_init(bt_mesh_dk_prov_init(), model_handler_init());
+	if (err) {
+		printk("bt_mesh_init failed: %d\n", err);
+		return err;
+	}
+
+	/* ── Flash 설정 복원 (이전 프로비저닝 / 네트워크 키 로드) ── */
+	if (IS_ENABLED(CONFIG_BT_SETTINGS)) {
+		settings_load();
+	}
+
+	/* ── 프로비저닝 Bearer 활성화 ──
+	 * settings_load()로 이미 프로비저닝된 경우 no-op.
+	 * 미프로비저닝 상태이면 ADV + GATT bearer로 광고 시작 → 앱에서 인식 가능.
+	 */
+	bt_mesh_prov_enable(BT_MESH_PROV_ADV | BT_MESH_PROV_GATT);
+
+	lcd_set_cursor(0, 0);
+	lcd_puts("BLE Mesh Ready! ");
+	lcd_set_cursor(0, 1);
+	lcd_puts(bt_mesh_is_provisioned() ? "Provisioned!    "
+					  : "Use nRF Mesh app");
+	k_msleep(1500);
+
+	/* ── 메인 루프: 센서 읽기 → Mesh publish → LCD 업데이트 ── */
 	while (1) {
 		struct sensor_value ax, ay, az;
-		char xbuf[7], ybuf[7], zbuf[7];
+		char xbuf[7], ybuf[7];
 		char line[17];
 
+		/* 1. ADXL345 샘플 취득 */
 		if (sensor_sample_fetch(accel) < 0) {
 			lcd_set_cursor(0, 0);
 			lcd_puts("  Fetch Error   ");
@@ -154,19 +250,48 @@ int main(void)
 		sensor_channel_get(accel, SENSOR_CHAN_ACCEL_Y, &ay);
 		sensor_channel_get(accel, SENSOR_CHAN_ACCEL_Z, &az);
 
+		/* 2. BLE Mesh publish (provisioned 상태에서만 실제 전송) */
+		if (bt_mesh_is_provisioned()) {
+			model_handler_publish_accel(
+				sv_to_centi(&ax),
+				sv_to_centi(&ay),
+				sv_to_centi(&az)
+			);
+		}
+
+		/* 3. LCD Line 0: 로컬 X, Y 가속도 */
 		fmt_sv(xbuf, &ax);
 		fmt_sv(ybuf, &ay);
-		fmt_sv(zbuf, &az);
-
-		/* Line 0: "X=-01.23Y= 09.81" → 16자 */
 		snprintf(line, sizeof(line), "X=%sY=%s", xbuf, ybuf);
 		lcd_set_cursor(0, 0);
 		lcd_puts(line);
 
-		/* Line 1: "Z=-01.23 m/s2   " → 16자 */
-		snprintf(line, sizeof(line), "Z=%s m/s2   ", zbuf);
-		lcd_set_cursor(0, 1);
-		lcd_puts(line);
+		/* 4. LCD Line 1: 원격 노드 데이터 또는 상태 메시지 */
+		if (!bt_mesh_is_provisioned()) {
+			lcd_set_cursor(0, 1);
+			lcd_puts("Mesh: no prov   ");
+		} else {
+			const struct model_handler_remote_accel *rem =
+				model_handler_get_remote_accel();
+
+			if (!rem->valid) {
+				lcd_set_cursor(0, 1);
+				lcd_puts("Mesh: waiting...");
+			} else {
+				/*
+				 * 원격 노드 주소(4자리 hex) + X 가속도 표시
+				 * 예) "R:0002 X+01.23  " (16자)
+				 */
+				char rx_buf[7];
+
+				fmt_centi(rx_buf, rem->x_centi);
+				snprintf(line, sizeof(line),
+					 "R:%04X X%s   ",
+					 rem->addr, rx_buf);
+				lcd_set_cursor(0, 1);
+				lcd_puts(line);
+			}
+		}
 
 		k_msleep(POLL_INTERVAL_MS);
 	}
