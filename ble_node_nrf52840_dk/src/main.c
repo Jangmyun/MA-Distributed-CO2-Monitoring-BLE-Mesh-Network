@@ -39,8 +39,9 @@ LOG_MODULE_REGISTER(chat, CONFIG_LOG_DEFAULT_LEVEL);
 #define ACCEL_NODE              DT_NODELABEL(adxl345)
 #define LCD_I2C_NODE            DT_NODELABEL(i2c0)
 #define LCD_ADDR                0x27
-#define POLL_INTERVAL_MS        200   /* 센서 샘플링 주기 */
+#define POLL_INTERVAL_MS        200   /* 센서 샘플링 주기 (LCD 갱신 기준) */
 #define CHANGE_THRESHOLD_CENTI  5     /* 변화 감지 임계값: 0.05 m/s² */
+#define MIN_PUB_INTERVAL_MS     1000  /* 변화 감지 시에도 최소 전송 간격 */
 #define KEEPALIVE_INTERVAL_MS   5000  /* 변화 없어도 강제 publish 주기 */
 
 /* PCF8574 핀 마스크 */
@@ -62,12 +63,19 @@ static inline int32_t i32_abs(int32_t v) { return v < 0 ? -v : v; }
 
 static bool accel_needs_publish(int32_t x, int32_t y, int32_t z)
 {
-	if (i32_abs(x - last_pub_x) > CHANGE_THRESHOLD_CENTI ||
-	    i32_abs(y - last_pub_y) > CHANGE_THRESHOLD_CENTI ||
-	    i32_abs(z - last_pub_z) > CHANGE_THRESHOLD_CENTI) {
+	int64_t elapsed = k_uptime_get() - last_pub_ms;
+
+	/* keepalive: 변화 여부 무관하게 강제 전송 */
+	if (elapsed >= KEEPALIVE_INTERVAL_MS) {
 		return true;
 	}
-	return (k_uptime_get() - last_pub_ms) >= KEEPALIVE_INTERVAL_MS;
+	/* 최소 전송 간격 미달 시 변화가 있어도 전송 보류 */
+	if (elapsed < MIN_PUB_INTERVAL_MS) {
+		return false;
+	}
+	return (i32_abs(x - last_pub_x) > CHANGE_THRESHOLD_CENTI ||
+		i32_abs(y - last_pub_y) > CHANGE_THRESHOLD_CENTI ||
+		i32_abs(z - last_pub_z) > CHANGE_THRESHOLD_CENTI);
 }
 
 /* ── PCF8574 / HD44780 저수준 ──────────────────────────────────────────── */
