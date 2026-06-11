@@ -39,9 +39,9 @@ LOG_MODULE_REGISTER(chat, CONFIG_LOG_DEFAULT_LEVEL);
 #define ACCEL_NODE              DT_NODELABEL(adxl345)
 #define LCD_I2C_NODE            DT_NODELABEL(i2c0)
 #define LCD_ADDR                0x27
-#define POLL_INTERVAL_MS        200   /* 센서 샘플링 주기 */
+#define POLL_INTERVAL_MS        200   /* 센서 샘플링 주기 (LCD 갱신 기준) */
 #define CHANGE_THRESHOLD_CENTI  5     /* 변화 감지 임계값: 0.05 m/s² */
-#define KEEPALIVE_INTERVAL_MS   5000  /* 변화 없어도 강제 publish 주기 */
+#define PUB_INTERVAL_MS         1000  /* BLE Mesh 전송 간격: 변화 감지 시 최대 1회/초 */
 
 /* PCF8574 핀 마스크 */
 #define LCD_RS  BIT(0)
@@ -62,12 +62,12 @@ static inline int32_t i32_abs(int32_t v) { return v < 0 ? -v : v; }
 
 static bool accel_needs_publish(int32_t x, int32_t y, int32_t z)
 {
-	if (i32_abs(x - last_pub_x) > CHANGE_THRESHOLD_CENTI ||
-	    i32_abs(y - last_pub_y) > CHANGE_THRESHOLD_CENTI ||
-	    i32_abs(z - last_pub_z) > CHANGE_THRESHOLD_CENTI) {
-		return true;
+	if ((k_uptime_get() - last_pub_ms) < PUB_INTERVAL_MS) {
+		return false;
 	}
-	return (k_uptime_get() - last_pub_ms) >= KEEPALIVE_INTERVAL_MS;
+	return (i32_abs(x - last_pub_x) > CHANGE_THRESHOLD_CENTI ||
+		i32_abs(y - last_pub_y) > CHANGE_THRESHOLD_CENTI ||
+		i32_abs(z - last_pub_z) > CHANGE_THRESHOLD_CENTI);
 }
 
 /* ── PCF8574 / HD44780 저수준 ──────────────────────────────────────────── */
